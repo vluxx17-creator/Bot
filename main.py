@@ -12,6 +12,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramForbiddenError
 
 # --- КОНФИГУРАЦИЯ ---
 TOKEN = '8782789238:AAENc2VrGUNUKQnUbI2SKt79dpJfJKF6UZo'
@@ -23,184 +24,160 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 session = None 
 
-class SearchStates(StatesGroup):
+class States(StatesGroup):
     vk = State()
     discord = State()
     ip = State()
     dork = State()
     telelog = State()
+    phone = State()
+    photo_search = State()
+    city_name = State()
+    add_admin = State()
+    broadcast = State()
 
 # --- БАЗА ДАННЫХ ---
 async def init_db():
     async with aiosqlite.connect("history.db") as db:
-        await db.execute("""CREATE TABLE IF NOT EXISTS search_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            type TEXT,
-            query TEXT,
-            result TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )""")
+        await db.execute("CREATE TABLE IF NOT EXISTS search_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, type TEXT, query TEXT, result TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
+        await db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)")
         await db.commit()
+
+async def is_admin(user_id):
+    if user_id == ADMIN_ID: return True
+    async with aiosqlite.connect("history.db") as db:
+        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cur:
+            return await cur.fetchone() is not None
 
 async def save_log(user_id, s_type, query, result):
     async with aiosqlite.connect("history.db") as db:
-        await db.execute("INSERT INTO search_logs (user_id, type, query, result) VALUES (?, ?, ?, ?)",
-                         (user_id, s_type, query, result))
+        await db.execute("INSERT INTO search_logs (user_id, type, query, result) VALUES (?, ?, ?, ?)", (user_id, s_type, query, result))
         await db.commit()
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-async def fetch_osint_data(query, source_type="general"):
-    """Универсальный парсер для Dork и Telelog"""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-    
-    if source_type == "telelog":
-        search_query = f"site:t.me OR site:tgstat.ru OR site:telemetr.io \"{query}\""
-    else:
-        search_query = query
-
-    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(search_query)}"
-    
+# --- ПАРСЕР KOMANDIROVKA.RU ---
+async def fetch_city_data(city_query):
+    h = {"User-Agent": "Mozilla/5.0"}
+    search_url = f"https://www.komandirovka.ru/search/?q={urllib.parse.quote(city_query)}"
     try:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200: return "❌ Ошибка доступа к данным."
-            html = await response.text()
-            soup = BeautifulSoup(html, 'html.parser')
-            results = []
-            blocks = soup.find_all('div', class_='result', limit=5)
+        async with session.get(search_url, headers=h) as r:
+            soup = BeautifulSoup(await r.text(), 'html.parser')
+            result_link = soup.find('a', class_='search-result__title')
+            if not result_link: return "🔍 Город или область не найдены в базе Komandirovka.ru"
             
-            for block in blocks:
-                title = block.find('a', class_='result__a').get_text(strip=True)
-                snippet = block.find('a', class_='result__snippet').get_text(strip=True)
-                results.append(f"🔹 **{title}**\n📝 {snippet}\n")
-            
-            return "\n".join(results) if results else "🔍 Данных в открытых архивах не найдено."
-    except Exception:
-        return "⚠️ Ошибка при сканировании архивов."
+            city_url = "https://www.komandirovka.ru" + result_link['href']
+            async with session.get(city_url, headers=h) as cr:
+                csoup = BeautifulSoup(await cr.text(), 'html.parser')
+                desc = csoup.find('div', class_='city-info__description')
+                info_text = desc.get_text(strip=True)[:500] if desc else "Описание отсутствует."
+                
+                return (f"🏙 **Результат поиска: {result_link.text}**\n"
+                        f"🔗 [Страница на Komandirovka.ru]({city_url})\n\n"
+                        f"📝 **Информация:** {info_text}...")
+    except: return "⚠️ Ошибка при подключении к сервису Komandirovka.ru"
 
-# --- КЛАВИАТУРА ---
-def main_kb(user_id):
+async def fetch_advanced_osint(query, mode="general"):
+    h = {"User-Agent": "Mozilla/5.0"}
+    if mode == "phone": q = f"\"{query}\" site:avito.ru OR site:vk.com"
+    elif mode == "telelog": q = f"site:t.me OR site:tgstat.ru \"{query}\""
+    else: q = query
+    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
+    try:
+        async with session.get(url, headers=h) as r:
+            soup = BeautifulSoup(await r.text(), 'html.parser')
+            res = [f"🔹 **{b.find('a', class_='result__a').text}**\n🔗 {b.find('a', class_='result__a')['href']}\n" 
+                   for b in soup.find_all('div', class_='result', limit=4)]
+            return "\n".join(res) if res else "🔍 Данные не найдены."
+    except: return "⚠️ Ошибка индексации."
+
+# --- КЛАВИАТУРЫ ---
+def main_kb(user_id, admin=False):
     buttons = [
         [KeyboardButton(text="👤 OSINT ВКонтакте"), KeyboardButton(text="🎮 OSINT Discord")],
-        [KeyboardButton(text="🌐 Проверка IP адрес")],
-        [KeyboardButton(text="🔎 Гугл Дорк"), KeyboardButton(text="📜 Телелог")]
+        [KeyboardButton(text="🌐 Проверка IP адрес"), KeyboardButton(text="📱 Поиск по номеру")],
+        [KeyboardButton(text="🔎 Гугл Дорк"), KeyboardButton(text="📜 Телелог")],
+        [KeyboardButton(text="🖼 Поиск по фото/городу")]
     ]
-    if user_id == ADMIN_ID: buttons.append([KeyboardButton(text="🔐 Админ-панель")])
+    if admin: buttons.append([KeyboardButton(text="🔐 Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 # --- ОБРАБОТЧИКИ ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("🚀 OSINT Бот активен.\nВыбери модуль ниже.", reply_markup=main_kb(message.from_user.id))
+    async with aiosqlite.connect("history.db") as db:
+        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (message.from_user.id,))
+        await db.commit()
+    admin_status = await is_admin(message.from_user.id)
+    await message.answer("🚀 OSINT Бот активен.\nВыберите модуль поиска.", reply_markup=main_kb(message.from_user.id, admin_status))
 
-# [1] Гугл Дорк
-@dp.message(F.text == "🔎 Гугл Дорк")
-async def s_dork(message: Message, state: FSMContext):
-    await message.answer("🔎 Введите объект поиска (ФИО, почта, ник):")
-    await state.set_state(SearchStates.dork)
+# [НОВОЕ] ПОИСК ПО ФОТО И ГОРОДУ
+@dp.message(F.text == "🖼 Поиск по фото/городу")
+async def s_photo_start(message: Message, state: FSMContext):
+    await message.answer("📸 Отправьте фото объекта или местности, которую нужно найти.\n\n(Если фото нет, просто напишите название города или области)")
+    await state.set_state(States.photo_search)
 
-@dp.message(SearchStates.dork)
-async def p_dork(message: Message, state: FSMContext):
-    msg = await message.answer("🔄 Глубокое сканирование интернета...")
-    res = await fetch_osint_data(message.text)
-    await message.answer(f"📊 **ОТЧЕТ ПО ЗАПРОСУ: {message.text}**\n\n{res}", parse_mode="Markdown", disable_web_page_preview=True)
-    await msg.delete()
+@dp.message(States.photo_search, F.photo)
+async def p_photo_rec(message: Message, state: FSMContext):
+    await message.answer("✅ Фото получено. Теперь введите **название города или области**, к которой оно может относиться (для поиска на Komandirovka.ru):")
+    await state.set_state(States.city_name)
+
+@dp.message(States.photo_search, F.text)
+async def p_photo_text(message: Message, state: FSMContext):
+    # Если пользователь сразу ввел текст вместо фото
+    res = await fetch_city_data(message.text)
+    await message.answer(res, parse_mode="Markdown")
     await state.clear()
 
-# [2] Телелог (ОБНОВЛЕННЫЙ)
-@dp.message(F.text == "📜 Телелог")
-async def s_telelog(message: Message, state: FSMContext):
-    await message.answer("📜 Введите @username пользователя Telegram:")
-    await state.set_state(SearchStates.telelog)
-
-@dp.message(SearchStates.telelog)
-async def p_telelog(message: Message, state: FSMContext):
-    target = message.text.replace("@", "")
-    msg = await message.answer(f"⏳ Собираю историю активности для @{target}...")
+@dp.message(States.city_name)
+async def p_city_final(message: Message, state: FSMContext):
+    msg = await message.answer(f"⏳ Ищу информацию по локации: {message.text}...")
+    res = await fetch_city_data(message.text)
     
-    # Получаем отчет по упоминаниям в истории групп и каналов
-    report = await fetch_osint_data(target, source_type="telelog")
-    
-    final_report = (
-        f"📜 **ОТЧЕТ ПО ИСТОРИИ: @{target}**\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🔍 **Найденные упоминания и старые имена:**\n\n{report}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"💡 *Если данных мало, значит пользователь скрыт настройками приватности или редко пишет в публичных чатах.*"
+    # Добавляем ссылки на визуальный поиск для помощи пользователю
+    visual_help = (
+        f"\n\n🌍 **Дополнительный визуальный поиск:**\n"
+        f"🔗 [Поиск в Google Images](https://www.google.com/searchbyimage?image_url=https://t.me/)\n"
+        f"🔗 [Поиск в Yandex Images](https://yandex.ru/images/search?rpt=imageview)"
     )
     
-    await save_log(message.from_user.id, "TELELOG", target, "Text Report Generated")
-    await message.answer(final_report, parse_mode="Markdown", disable_web_page_preview=True)
-    await msg.delete()
+    await msg.edit_text(res + visual_help, parse_mode="Markdown", disable_web_page_preview=True)
+    await save_log(message.from_user.id, "CITY_PHOTO", message.text, "City Data Fetched")
     await state.clear()
 
-# [Остальные функции ВК, Discord, IP, Админка...]
+# [ОСТАЛЬНЫЕ МОДУЛИ]
+@dp.message(F.text == "📱 Поиск по номеру")
+async def s_phone(message: Message, state: FSMContext):
+    await message.answer("📱 Введите номер телефона:")
+    await state.set_state(States.phone)
 
-@dp.message(F.text == "👤 OSINT ВКонтакте")
-async def s_vk(message: Message, state: FSMContext):
-    await message.answer("🔗 Введите ID или ник ВК:")
-    await state.set_state(SearchStates.vk)
-
-@dp.message(SearchStates.vk)
-async def p_vk(message: Message, state: FSMContext):
-    url = f"https://api.vk.com/method/users.get?user_ids={message.text}&fields=photo_max,domain,city&access_token={VK_API_TOKEN}&v=5.131"
-    async with session.get(url) as resp:
-        res = await resp.json()
-        if 'response' in res and res['response']:
-            u = res['response'][0]
-            info = f"👤 {u['first_name']} {u['last_name']}\n🆔 ID: {u['id']} | @{u.get('domain')}"
-            if u.get('photo_max'): await message.answer_photo(u['photo_max'], caption=info)
-            else: await message.answer(info)
-        else: await message.answer("❌ Ошибка.")
+@dp.message(States.phone)
+async def p_phone(message: Message, state: FSMContext):
+    res = await fetch_advanced_osint(message.text, mode="phone")
+    await message.answer(f"📱 **ОТЧЕТ:**\n\n{res}", parse_mode="Markdown")
     await state.clear()
 
-@dp.message(F.text == "🎮 OSINT Discord")
-async def s_discord(message: Message, state: FSMContext):
-    await message.answer("🆔 Введите ID Discord:")
-    await state.set_state(SearchStates.discord)
+@dp.message(F.text == "🔎 Гугл Дорк")
+async def s_dork(message: Message, state: FSMContext):
+    await message.answer("🔎 Введите объект поиска:")
+    await state.set_state(States.dork)
 
-@dp.message(SearchStates.discord)
-async def p_discord(message: Message, state: FSMContext):
-    headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
-    async with session.get(f"https://discord.com/api/v10/users/{message.text}", headers=headers) as resp:
-        if resp.status == 200:
-            d = await resp.json()
-            await message.answer(f"🎮 Discord: {d['username']}")
-        else: await message.answer("❌ Ошибка.")
-    await state.clear()
-
-@dp.message(F.text == "🌐 Проверка IP адрес")
-async def s_ip(message: Message, state: FSMContext):
-    await message.answer("🌐 Введите IP:")
-    await state.set_state(SearchStates.ip)
-
-@dp.message(SearchStates.ip)
-async def p_ip(message: Message, state: FSMContext):
-    async with session.get(f"http://ip-api.com/json/{message.text}") as r:
-        d = await r.json()
-        if d.get('status') == 'success': await message.answer(f"🌐 IP: {d['query']}\n📍 Страна: {d['country']}")
-        else: await message.answer("❌ Ошибка.")
+@dp.message(States.dork)
+async def p_dork(message: Message, state: FSMContext):
+    res = await fetch_advanced_osint(message.text)
+    await message.answer(f"📊 **ОТЧЕТ:**\n\n{res}", parse_mode="Markdown")
     await state.clear()
 
 @dp.message(F.text == "🔐 Админ-панель")
 async def admin_panel(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📥 Скачать базу")], [KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
-    await message.answer("Админка.", reply_markup=kb)
-
-@dp.message(F.text == "📥 Скачать базу")
-async def download_logs(message: Message):
-    if message.from_user.id != ADMIN_ID: return
-    async with aiosqlite.connect("history.db") as db:
-        async with db.execute("SELECT * FROM search_logs") as cursor:
-            rows = await cursor.fetchall()
-    file = BufferedInputFile("\n".join([str(r) for r in rows]).encode(), filename="history.txt")
-    await message.answer_document(file)
+    if not await is_admin(message.from_user.id): return
+    btns = [[KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="📥 Скачать базу")], [KeyboardButton(text="➕ Добавить админа")], [KeyboardButton(text="⬅️ Назад")]]
+    await message.answer("🛠 Админка:", reply_markup=ReplyKeyboardMarkup(keyboard=btns, resize_keyboard=True))
 
 @dp.message(F.text == "⬅️ Назад")
-async def back_to_main(message: Message):
-    await message.answer("Главное меню:", reply_markup=main_kb(message.from_user.id))
+async def back(message: Message):
+    admin_status = await is_admin(message.from_user.id)
+    await message.answer("Главное меню:", reply_markup=main_kb(message.from_user.id, admin_status))
 
 async def main():
     global session
