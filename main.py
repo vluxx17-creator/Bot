@@ -3,6 +3,7 @@ import aiosqlite
 import os
 import aiohttp
 import urllib.parse
+from bs4 import BeautifulSoup
 from datetime import datetime
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -48,6 +49,35 @@ async def save_log(user_id, s_type, query, result):
                          (user_id, s_type, query, result))
         await db.commit()
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+async def fetch_osint_data(query, source_type="general"):
+    """Универсальный парсер для Dork и Telelog"""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+    
+    if source_type == "telelog":
+        search_query = f"site:t.me OR site:tgstat.ru OR site:telemetr.io \"{query}\""
+    else:
+        search_query = query
+
+    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(search_query)}"
+    
+    try:
+        async with session.get(url, headers=headers) as response:
+            if response.status != 200: return "❌ Ошибка доступа к данным."
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            results = []
+            blocks = soup.find_all('div', class_='result', limit=5)
+            
+            for block in blocks:
+                title = block.find('a', class_='result__a').get_text(strip=True)
+                snippet = block.find('a', class_='result__snippet').get_text(strip=True)
+                results.append(f"🔹 **{title}**\n📝 {snippet}\n")
+            
+            return "\n".join(results) if results else "🔍 Данных в открытых архивах не найдено."
+    except Exception:
+        return "⚠️ Ошибка при сканировании архивов."
+
 # --- КЛАВИАТУРА ---
 def main_kb(user_id):
     buttons = [
@@ -55,53 +85,79 @@ def main_kb(user_id):
         [KeyboardButton(text="🌐 Проверка IP адрес")],
         [KeyboardButton(text="🔎 Гугл Дорк"), KeyboardButton(text="📜 Телелог")]
     ]
-    if user_id == ADMIN_ID:
-        buttons.append([KeyboardButton(text="🔐 Админ-панель")])
+    if user_id == ADMIN_ID: buttons.append([KeyboardButton(text="🔐 Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-# --- ОБРАБОТЧИКИ (START) ---
+# --- ОБРАБОТЧИКИ ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    text = (
-        "🚀 Приветствую в @searchHams_bot\n\n"
-        "Выбери нужный модуль поиска ниже.\n\n"
-        "📢 Канал: @owhig"
-    )
-    await message.answer(text, reply_markup=main_kb(message.from_user.id))
+    await message.answer("🚀 OSINT Бот активен.\nВыбери модуль ниже.", reply_markup=main_kb(message.from_user.id))
 
-# --- [1] ВКОНТАКТЕ ---
+# [1] Гугл Дорк
+@dp.message(F.text == "🔎 Гугл Дорк")
+async def s_dork(message: Message, state: FSMContext):
+    await message.answer("🔎 Введите объект поиска (ФИО, почта, ник):")
+    await state.set_state(SearchStates.dork)
+
+@dp.message(SearchStates.dork)
+async def p_dork(message: Message, state: FSMContext):
+    msg = await message.answer("🔄 Глубокое сканирование интернета...")
+    res = await fetch_osint_data(message.text)
+    await message.answer(f"📊 **ОТЧЕТ ПО ЗАПРОСУ: {message.text}**\n\n{res}", parse_mode="Markdown", disable_web_page_preview=True)
+    await msg.delete()
+    await state.clear()
+
+# [2] Телелог (ОБНОВЛЕННЫЙ)
+@dp.message(F.text == "📜 Телелог")
+async def s_telelog(message: Message, state: FSMContext):
+    await message.answer("📜 Введите @username пользователя Telegram:")
+    await state.set_state(SearchStates.telelog)
+
+@dp.message(SearchStates.telelog)
+async def p_telelog(message: Message, state: FSMContext):
+    target = message.text.replace("@", "")
+    msg = await message.answer(f"⏳ Собираю историю активности для @{target}...")
+    
+    # Получаем отчет по упоминаниям в истории групп и каналов
+    report = await fetch_osint_data(target, source_type="telelog")
+    
+    final_report = (
+        f"📜 **ОТЧЕТ ПО ИСТОРИИ: @{target}**\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🔍 **Найденные упоминания и старые имена:**\n\n{report}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💡 *Если данных мало, значит пользователь скрыт настройками приватности или редко пишет в публичных чатах.*"
+    )
+    
+    await save_log(message.from_user.id, "TELELOG", target, "Text Report Generated")
+    await message.answer(final_report, parse_mode="Markdown", disable_web_page_preview=True)
+    await msg.delete()
+    await state.clear()
+
+# [Остальные функции ВК, Discord, IP, Админка...]
+
 @dp.message(F.text == "👤 OSINT ВКонтакте")
 async def s_vk(message: Message, state: FSMContext):
-    await message.answer("🔗 Введите ID или никнейм ВК:")
+    await message.answer("🔗 Введите ID или ник ВК:")
     await state.set_state(SearchStates.vk)
 
 @dp.message(SearchStates.vk)
 async def p_vk(message: Message, state: FSMContext):
-    url = f"https://api.vk.com/method/users.get?user_ids={message.text}&fields=photo_max,domain,bdate,city,status,followers_count,relation,occupation,site,verified&access_token={VK_API_TOKEN}&v=5.131"
+    url = f"https://api.vk.com/method/users.get?user_ids={message.text}&fields=photo_max,domain,city&access_token={VK_API_TOKEN}&v=5.131"
     async with session.get(url) as resp:
         res = await resp.json()
         if 'response' in res and res['response']:
             u = res['response'][0]
-            rel = {1:"Одинокий", 2:"Есть друг", 3:"Помолвлен", 4:"В браке", 5:"Сложно", 6:"В поиске", 7:"Влюблен", 8:"Гражд. брак"}.get(u.get('relation'), "Скрыто")
-            info = (
-                f"👤 {u['first_name']} {u['last_name']} {'✅' if u.get('verified') else ''}\n"
-                f"🆔 ID: {u['id']} | @{u.get('domain')}\n"
-                f"🎂 ДР: {u.get('bdate', 'Скрыто')}\n"
-                f"🏙 Город: {u.get('city', {}).get('title', 'N/A')}\n"
-                f"💍 Отношения: {rel}\n"
-                f"👥 Подписчиков: {u.get('followers_count', 0)}\n"
-                f"🌐 Сайт: {u.get('site', 'Нет')}"
-            )
-            await save_log(message.from_user.id, "VK", message.text, info)
+            info = f"👤 {u['first_name']} {u['last_name']}\n🆔 ID: {u['id']} | @{u.get('domain')}"
             if u.get('photo_max'): await message.answer_photo(u['photo_max'], caption=info)
             else: await message.answer(info)
-        else: await message.answer("❌ Ошибка поиска ВК.")
+        else: await message.answer("❌ Ошибка.")
     await state.clear()
 
-# --- [2] DISCORD ---
 @dp.message(F.text == "🎮 OSINT Discord")
 async def s_discord(message: Message, state: FSMContext):
-    await message.answer("🆔 Введите ID пользователя Discord:")
+    await message.answer("🆔 Введите ID Discord:")
     await state.set_state(SearchStates.discord)
 
 @dp.message(SearchStates.discord)
@@ -110,81 +166,28 @@ async def p_discord(message: Message, state: FSMContext):
     async with session.get(f"https://discord.com/api/v10/users/{message.text}", headers=headers) as resp:
         if resp.status == 200:
             d = await resp.json()
-            reg_date = datetime.fromtimestamp(((int(d['id']) >> 22) + 1420070400000) / 1000).strftime('%d.%m.%Y')
-            report = f"🎮 DISCORD OSINT\n━━━━━━━━━━━━━━\n👤 Имя: {d['username']}\n🆔 ID: {d['id']}\n📅 Регистрация: {reg_date}\n━━━━━━━━━━━━━━"
-            await save_log(message.from_user.id, "DISCORD", message.text, report)
-            await message.answer(report)
-        else: await message.answer("❌ Discord ID не найден.")
+            await message.answer(f"🎮 Discord: {d['username']}")
+        else: await message.answer("❌ Ошибка.")
     await state.clear()
 
-# --- [3] IP ---
 @dp.message(F.text == "🌐 Проверка IP адрес")
 async def s_ip(message: Message, state: FSMContext):
-    await message.answer("🌐 Введите IP адрес:")
+    await message.answer("🌐 Введите IP:")
     await state.set_state(SearchStates.ip)
 
 @dp.message(SearchStates.ip)
 async def p_ip(message: Message, state: FSMContext):
-    async with session.get(f"http://ip-api.com/json/{message.text}?fields=66846719") as r:
+    async with session.get(f"http://ip-api.com/json/{message.text}") as r:
         d = await r.json()
-        if d.get('status') == 'success':
-            res_text = f"🌐 IP: {d['query']}\n📍 Страна: {d['country']}\n🏙 Город: {d['city']}\n🏢 ISP: {d['isp']}\n🛡 VPN: {'Да' if d['proxy'] else 'Нет'}"
-            await save_log(message.from_user.id, "IP", message.text, res_text)
-            await message.answer(res_text)
-        else: await message.answer("❌ IP не найден.")
+        if d.get('status') == 'success': await message.answer(f"🌐 IP: {d['query']}\n📍 Страна: {d['country']}")
+        else: await message.answer("❌ Ошибка.")
     await state.clear()
 
-# --- [4] ГУГЛ ДОРК (Google Dorks) ---
-@dp.message(F.text == "🔎 Гугл Дорк")
-async def s_dork(message: Message, state: FSMContext):
-    await message.answer("🔎 Введите объект поиска (ФИО, Никнейм, Почта или Номер):")
-    await state.set_state(SearchStates.dork)
-
-@dp.message(SearchStates.dork)
-async def p_dork(message: Message, state: FSMContext):
-    query = message.text
-    encoded_query = urllib.parse.quote(f'"{query}"')
-    
-    dorks = (
-        f"🔎 **Результаты Google Dorks для: {query}**\n\n"
-        f"🔗 [Поиск по соцсетям](https://www.google.com/search?q={encoded_query}+site:linkedin.com+OR+site:instagram.com+OR+site:facebook.com+OR+site:twitter.com)\n"
-        f"📂 [Поиск документов (PDF, Doc)](https://www.google.com/search?q={encoded_query}+filetype:pdf+OR+filetype:doc+OR+filetype:xlsx)\n"
-        f"💬 [Упоминания в Telegram/Vkontakte](https://www.google.com/search?q={encoded_query}+site:t.me+OR+site:vk.com)\n"
-        f"📧 [Поиск паролей/утечек](https://www.google.com/search?q={encoded_query}+\"password\"+OR+\"leak\"+OR+\"database\")\n"
-        f"💻 [Поиск на GitHub/Pastebin](https://www.google.com/search?q={encoded_query}+site:github.com+OR+site:pastebin.com)\n"
-    )
-    await save_log(message.from_user.id, "DORK", query, "Generated links")
-    await message.answer(dorks, parse_mode="Markdown", disable_web_page_preview=True)
-    await state.clear()
-
-# --- [5] ТЕЛЕЛОГ (История ников Telegram) ---
-@dp.message(F.text == "📜 Телелог")
-async def s_telelog(message: Message, state: FSMContext):
-    await message.answer("📜 Введите @username или ID пользователя Telegram:")
-    await state.set_state(SearchStates.telelog)
-
-@dp.message(SearchStates.telelog)
-async def p_telelog(message: Message, state: FSMContext):
-    target = message.text.replace("@", "")
-    
-    # Ссылки на внешние сервисы логирования истории
-    tele_report = (
-        f"📜 **Отчет Telelog для: @{target}**\n\n"
-        f"1️⃣ [История в TGStat](https://tgstat.ru/user/@{target})\n"
-        f"2️⃣ [Анализ в Telemetr](https://telemetr.io/ru/user/@{target})\n"
-        f"3️⃣ [Поиск в базах (Google)](https://www.google.com/search?q=site:t.me+\"{target}\")\n\n"
-        f"ℹ️ *Примечание: Если пользователь менял ник недавно, данные появятся в течение 24-48 часов.*"
-    )
-    await save_log(message.from_user.id, "TELELOG", target, "Generated report links")
-    await message.answer(tele_report, parse_mode="Markdown", disable_web_page_preview=True)
-    await state.clear()
-
-# --- АДМИНКА ---
 @dp.message(F.text == "🔐 Админ-панель")
 async def admin_panel(message: Message):
     if message.from_user.id != ADMIN_ID: return
     kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📥 Скачать базу")], [KeyboardButton(text="⬅️ Назад")]], resize_keyboard=True)
-    await message.answer("Добро пожаловать в админ-панель.", reply_markup=kb)
+    await message.answer("Админка.", reply_markup=kb)
 
 @dp.message(F.text == "📥 Скачать базу")
 async def download_logs(message: Message):
@@ -192,15 +195,13 @@ async def download_logs(message: Message):
     async with aiosqlite.connect("history.db") as db:
         async with db.execute("SELECT * FROM search_logs") as cursor:
             rows = await cursor.fetchall()
-    log_text = "\n".join([str(r) for r in rows])
-    file = BufferedInputFile(log_text.encode(), filename="history.txt")
-    await message.answer_document(file, caption="✅ База запросов")
+    file = BufferedInputFile("\n".join([str(r) for r in rows]).encode(), filename="history.txt")
+    await message.answer_document(file)
 
 @dp.message(F.text == "⬅️ Назад")
 async def back_to_main(message: Message):
     await message.answer("Главное меню:", reply_markup=main_kb(message.from_user.id))
 
-# --- ЗАПУСК ---
 async def main():
     global session
     await init_db()
@@ -209,10 +210,8 @@ async def main():
     app.router.add_get('/', lambda r: web.Response(text="Bot Active"))
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080))).start()
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await session.close()
+    try: await dp.start_polling(bot)
+    finally: await session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
